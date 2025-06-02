@@ -323,6 +323,65 @@ func Rebuild(db *gorm.DB, source interface{}, doUpdate bool) (affectedCount int,
 	return
 }
 
+
+// RebuildBatched rebuild nodes as any nestedset which in the scope
+// ```nestedset.RebuildBatched(db, &node, true, 1000)``` will rebuild [&node] as nestedset
+func RebuildBatched(db *gorm.DB, source interface{}, doUpdate bool, batchSize int) (affectedCount int, err error) {
+	tx, target, err := parseNode(db, source)
+	if err != nil {
+		return
+	}
+	err = tx.Transaction(func(tx *gorm.DB) (err error) {
+		allItems := []*nestedItem{}
+		err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where(formatSQL("", target)).
+			Order(formatSQL(":parent_id ASC NULLS FIRST, :lft ASC", target)).
+			Find(&allItems).
+			Error
+
+		if err != nil {
+			return
+		}
+		initTree(allItems).rebuild()
+
+		var itemsToUpdate []*nestedItem
+		for _, item := range allItems {
+			if item.IsChanged {
+				affectedCount += 1
+				if doUpdate {
+					itemsToUpdate = append(itemsToUpdate, item)
+				}
+			}
+		}
+		if doUpdate && len(itemsToUpdate) > 0 {
+			err = batchUpdate(tx, []string{"lft", "rgt", "depth", "children_count"}, target.DbNames, itemsToUpdate, batchSize)
+			if err != nil {
+				return
+			}
+		}
+		return nil
+	})
+	return
+}
+
+// batchUpdate performs a batched upsert (update on conflict) for the given columns and items.
+func batchUpdate(db *gorm.DB, columns []string, dbNames map[string]string, items []*nestedItem, batchSize int) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	assignmentMap := map[string]interface{}{}
+	for _, column := range columns {
+		column = dbNames[column]
+		assignmentMap[column] = gorm.Expr("EXCLUDED." + column)
+	}
+	
+	return db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: dbNames["id"]}},
+		DoUpdates: clause.Assignments(assignmentMap),
+	}).CreateInBatches(items, batchSize).Error
+}
+
 func moveIsValid(node, to nestedItem) error {
 	validLft, validRgt := node.Lft, node.Rgt
 	if (to.Lft >= validLft && to.Lft <= validRgt) || (to.Rgt >= validLft && to.Rgt <= validRgt) {
